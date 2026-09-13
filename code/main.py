@@ -2,6 +2,8 @@ import os
 import pandas as pd
 import logging
 import asyncio
+import random
+import time
 from dotenv import load_dotenv
 from agent import FinancialAgent, TokenTracker
 from data_loader import DataLoader
@@ -10,55 +12,105 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 csv_lock = asyncio.Lock()
 
+# 1. PROACTIVE PACING: Enforce a strict delay BEFORE hitting the API
+class GlobalRateLimiter:
+    def __init__(self, calls_per_minute: int):
+        self.interval = 60.0 / calls_per_minute
+        self.last_call = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_call
+            if elapsed < self.interval:
+                await asyncio.sleep(self.interval - elapsed)
+            self.last_call = time.monotonic()
+
+# Cap the entire system at 2 Requests Per Minute (TPM) to avoid hitting the API's rate limits. This is a global limit across all workers.
+rate_limiter = GlobalRateLimiter(calls_per_minute=2)
+# Cap the number of simultaneous network connections at 5
+api_semaphore = asyncio.Semaphore(5)
+
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 async def worker(agent, queue, cache_file):
-    max_retries = 8
-    base_delay = 15.0
+    base_delay = 10.0
+    max_retries = 5
 
     while True:
         try:
-            batch_rows, batch_contexts = queue.get_nowait()
-        except asyncio.QueueEmpty:
+            item = await queue.get()
+        except asyncio.CancelledError:
             break
 
+        if item is None:
+            queue.task_done()
+            break
+
+        batch_rows, batch_contexts, model, attempt = item
         batch_ids = [r['request_id'] for r in batch_rows]
-        logging.info(f"🚀 [Agent {agent.agent_id}] Evaluating Batch of {len(batch_rows)}: {batch_ids[0]} to {batch_ids[-1]}...")
         
         final_decisions = []
+        success = False
         
-        for attempt in range(max_retries):
-            try:
-                response_data = await agent.async_evaluate_batch(batch_contexts)
-                decisions_list = response_data.get('decisions', [])
-                decision_map = {d.get("request_id"): d for d in decisions_list if "request_id" in d}
+        try:
+            # 2. WAIT FOR THE GREEN LIGHT: Prevents the bottleneck before it happens
+            await rate_limiter.wait()
+            
+            async with api_semaphore:
+                logging.info(f"🚀 [Agent {agent.agent_id}] Evaluating Batch of {len(batch_rows)} ({model}) (Attempt {attempt+1}): {batch_ids[0]} to {batch_ids[-1]}...")
                 
-                for r_id in batch_ids:
-                    if r_id in decision_map:
-                        decision = decision_map[r_id]
-                        if decision.get("earliest_date_for_full_payment") in ["none", "None", "N/A", "null"]:
-                            decision["earliest_date_for_full_payment"] = ""
-                        final_decisions.append(decision)
-                    else:
-                        logging.warning(f"[Agent {agent.agent_id}] AI omitted request {r_id}. Applying fallback.")
-                        final_decisions.append({
-                            "request_id": r_id, "amount_safe_to_pay": 0.0, "affordability_status": "not_affordable",
-                            "recommended_payment_method": "not_recommended", "payment_plan": "none",
-                            "earliest_date_for_full_payment": "", "spending_changes_needed": "none",
-                            "decision_explanation": "Model omission fallback."
-                        })
-                break 
-                
-            except Exception as e:
-                error_str = str(e)
-                if any(err in error_str for err in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
-                    wait_time = base_delay * (1.5 ** attempt)
-                    logging.warning(f"[Agent {agent.agent_id}] API Busy. Cooling down for {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})")
-                    await asyncio.sleep(wait_time)
+                response_data = await asyncio.wait_for(
+                    agent.async_evaluate_batch(batch_contexts, model=model),
+                    timeout=180.0
+                )
+            
+            decisions_list = response_data.get('decisions', [])
+            decision_map = {d.get("request_id"): d for d in decisions_list if isinstance(d, dict) and "request_id" in d}
+            
+            for r_id in batch_ids:
+                if r_id in decision_map:
+                    decision = decision_map[r_id]
+                    if str(decision.get("earliest_date_for_full_payment")).lower() in ["none", "n/a", "null"]:
+                        decision["earliest_date_for_full_payment"] = ""
+                    final_decisions.append(decision)
                 else:
-                    logging.error(f"[Agent {agent.agent_id}] Batch Failed unrecoverably: {e}")
+                    logging.warning(f"⚠️ [Agent {agent.agent_id}] AI omitted request {r_id}. Applying fallback.")
+                    final_decisions.append({
+                        "request_id": r_id, "amount_safe_to_pay": 0.0, "affordability_status": "not_affordable",
+                        "recommended_payment_method": "not_recommended", "payment_plan": "none",
+                        "earliest_date_for_full_payment": "", "spending_changes_needed": "none",
+                        "decision_explanation": "Model omission fallback."
+                    })
+            success = True
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = any(err in error_str for err in ["429", "resource_exhausted", "503", "unavailable", "quota"])
+            is_timeout = isinstance(e, asyncio.TimeoutError)
+            
+            if is_rate_limit:
+                wait_time = (base_delay * (1.5 ** attempt)) * random.uniform(0.8, 1.2)
+                logging.warning(f"⏳ [Agent {agent.agent_id}] API Busy. Re-queueing and cooling down for {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+                await queue.put((batch_rows, batch_contexts, model, attempt + 1))
+                queue.task_done()
+                continue
+            else:
+                logging.warning(f"⚠️ [Agent {agent.agent_id}] Batch Failed ({'Timeout' if is_timeout else 'Error: ' + str(e)[:100]}).")
+                
+                if attempt >= 1 and len(batch_rows) > 1:
+                    logging.info(f"✂️ [Agent {agent.agent_id}] Splitting batch of {len(batch_rows)} to recover.")
+                    mid = len(batch_rows) // 2
+                    await queue.put((batch_rows[:mid], batch_contexts[:mid], model, attempt + 1))
+                    await queue.put((batch_rows[mid:], batch_contexts[mid:], model, attempt + 1))
+                elif attempt < max_retries:
+                    await queue.put((batch_rows, batch_contexts, model, attempt + 1))
+                else:
+                    logging.error(f"💀 [Agent {agent.agent_id}] Exhausted retries for {batch_ids[0]}. Applying fallback.")
                     for r_id in batch_ids:
                         final_decisions.append({
                             "request_id": r_id, "amount_safe_to_pay": 0.0, "affordability_status": "not_affordable",
@@ -66,18 +118,16 @@ async def worker(agent, queue, cache_file):
                             "earliest_date_for_full_payment": "", "spending_changes_needed": "none",
                             "decision_explanation": "Error fallback."
                         })
-                    break
-        else:
-            logging.error(f"[Agent {agent.agent_id}] Exhausted retries for batch {batch_ids[0]}.")
+                    success = True
 
-        if final_decisions:
+        if success and final_decisions:
             good_decisions = [d for d in final_decisions if "fallback" not in str(d.get("decision_explanation", "")).lower()]
             if good_decisions:
                 async with csv_lock:
                     pd.DataFrame(good_decisions).to_csv(cache_file, mode='a', header=not os.path.exists(cache_file), index=False)
-        
-        logging.info(f"✅ [Agent {agent.agent_id}] Batch processed. Resting for 20 seconds before next batch...")
-        await asyncio.sleep(20.0)
+            
+            logging.info(f"✅ [Agent {agent.agent_id}] Processed batch starting at {batch_ids[0]}.")
+            
         queue.task_done()
 
 async def main():
@@ -101,19 +151,16 @@ async def main():
         logging.error("FATAL: requests.csv loaded empty data.")
         return
 
-    # Gather API keys from .env
-    api_keys = []
-    for k, v in os.environ.items():
-        if k.startswith("GEMINI_API_KEY") and v.strip():
-            api_keys.append(v.strip())
+    api_keys = [v.strip() for k, v in os.environ.items() if k.startswith("GEMINI_API_KEY") and v.strip()]
             
     if not api_keys:
         logging.error("FATAL: No GEMINI_API_KEY found in .env.")
         return
         
-    logging.info(f"🚀 Spawning {len(api_keys)} parallel workers based on available API keys.")
+    # 3. REDUCE PARALLELISM: We do not need 25 workers. 5 is plenty and prevents quota burn.
+    num_workers = min(len(api_keys), 5)
+    logging.info(f"🚀 Spawning {num_workers} parallel workers to protect quota and rate limits.")
     
-    # Process caching BEFORE queueing
     cached_ids = set()
     if os.path.exists(output_path):
         try:
@@ -131,25 +178,40 @@ async def main():
         logging.info("All requests processed!")
     else:
         queue = asyncio.Queue()
-        batches = list(chunk_list(pending_rows_list, 10))
+        # Batch size changed to 15 due to TPM limits
+        batches = list(chunk_list(pending_rows_list, 15))
         for batch in batches:
             batch_contexts = [loader.get_unified_context(r) for r in batch]
-            queue.put_nowait((batch, batch_contexts))
+            queue.put_nowait((batch, batch_contexts, "gemini-3.8-flash", 0))
 
-        # Spawn workers
         worker_tasks = []
-        for i, key in enumerate(api_keys):
+        for i in range(num_workers):
+            key = api_keys[i]
             agent = FinancialAgent(tracker, api_key=key, agent_id=i+1)
             task = asyncio.create_task(worker(agent, queue, output_path))
             worker_tasks.append(task)
             
-        await asyncio.gather(*worker_tasks)
+        await queue.join()
+        
+        for _ in worker_tasks:
+            queue.put_nowait(None)
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-    # Compile final results
     if os.path.exists(output_path):
         final_df = pd.read_csv(output_path)
         final_df.drop_duplicates(subset=['request_id'], keep='last', inplace=True)
         
+        missing_ids = set(loader.requests['request_id']) - set(final_df['request_id'])
+        if missing_ids:
+            logging.warning(f"Adding fallbacks for {len(missing_ids)} missing requests.")
+            missing_rows = [{
+                "request_id": m_id, "amount_safe_to_pay": 0.0, "affordability_status": "not_affordable",
+                "recommended_payment_method": "not_recommended", "payment_plan": "none",
+                "earliest_date_for_full_payment": "", "spending_changes_needed": "none",
+                "decision_explanation": "Final safety fallback."
+            } for m_id in missing_ids]
+            final_df = pd.concat([final_df, pd.DataFrame(missing_rows)], ignore_index=True)
+
         order_map = {req_id: idx for idx, req_id in enumerate(loader.requests['request_id'])}
         final_df['sort_idx'] = final_df['request_id'].map(order_map)
         final_df = final_df.sort_values('sort_idx').drop('sort_idx', axis=1)
