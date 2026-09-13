@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import copy
 from google import genai
 from google.genai import types
 import PIL.Image
@@ -24,30 +25,64 @@ class BatchFinancialDecisions(BaseModel):
 
 class TokenTracker:
     def __init__(self):
-        self.metrics = {"gemini-3.6-flash": {"prompt": 0, "completion": 0, "calls": 0, "cost_in": 0.0, "cost_out": 0.0}}
+        self.metrics = {}
         self.lock = asyncio.Lock()
         
     async def add(self, model, prompt, completion):
         async with self.lock:
-            self.add_sync(model, prompt, completion)
-
-    def add_sync(self, model, prompt, completion):
-        if model not in self.metrics:
-            self.metrics[model] = {"prompt": 0, "completion": 0, "calls": 0, "cost_in": 0.0, "cost_out": 0.0}
-        self.metrics[model]["prompt"] += int(prompt or 0)
-        self.metrics[model]["completion"] += int(completion or 0)
-        self.metrics[model]["calls"] += 1
+            if model not in self.metrics:
+                self.metrics[model] = {"prompt": 0, "completion": 0, "calls": 0}
+            self.metrics[model]["prompt"] += int(prompt or 0)
+            self.metrics[model]["completion"] += int(completion or 0)
+            self.metrics[model]["calls"] += 1
 
     def generate_report(self, num_requests, output_path):
-        total_in, total_out, total_calls = 0, 0, 0
+        total_in = 0
+        total_out = 0
+        total_calls = 0
+        total_cost = 0.0
+        
+        # Base pricing per 1M tokens 
+        pricing = {
+            "gemini-3.6-flash": {"in": 0.075 / 1_000_000, "out": 0.30 / 1_000_000},
+            "gemini-3.6-pro": {"in": 1.25 / 1_000_000, "out": 5.00 / 1_000_000}
+        }
+        
         report = f"# AI Token Usage and Cost Analysis\n* **Total Requests Evaluated:** {num_requests}\n\n"
+        
         for m, data in self.metrics.items():
             if data['calls'] > 0:
-                total_in += data['prompt']; total_out += data['completion']; total_calls += data['calls']
-                report += f"### Model: {m}\n- **Calls:** {data['calls']} | **In Tokens:** {data['prompt']:,} | **Out Tokens:** {data['completion']:,} | **Cost:** $0.0000 (Free Tier)\n\n"
-        report += f"### Overall Totals\n- **Total Calls:** {total_calls}\n- **Total Tokens:** {total_in + total_out:,}\n- **Avg Tokens/Req:** {(total_in + total_out)/max(1, num_requests):,.0f}\n"
+                total_in += data['prompt']
+                total_out += data['completion']
+                total_calls += data['calls']
+                
+                rate_in = pricing.get(m, pricing["gemini-3.6-flash"])["in"]
+                rate_out = pricing.get(m, pricing["gemini-3.6-flash"])["out"]
+                
+                cost_in = data['prompt'] * rate_in
+                cost_out = data['completion'] * rate_out
+                m_cost = cost_in + cost_out
+                total_cost += m_cost
+                
+                report += f"### Model: {m}\n"
+                report += f"- **Calls:** {data['calls']}\n"
+                report += f"- **In Tokens:** {data['prompt']:,} (${cost_in:.4f})\n"
+                report += f"- **Out Tokens:** {data['completion']:,} (${cost_out:.4f})\n"
+                report += f"- **Estimated Cost:** ${m_cost:.4f}\n\n"
+                
+        avg_tokens = (total_in + total_out) / max(1, num_requests)
+        avg_cost = total_cost / max(1, num_requests)
+        
+        report += f"### Overall Totals\n"
+        report += f"- **Total Calls:** {total_calls}\n"
+        report += f"- **Total Tokens:** {total_in + total_out:,}\n"
+        report += f"- **Avg Tokens/Req:** {avg_tokens:,.0f}\n"
+        report += f"- **Total Cost:** ${total_cost:.4f}\n"
+        report += f"- **Avg Cost/Req:** ${avg_cost:.4f}\n"
+        
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w") as f: f.write(report)
+        with open(output_path, "w", encoding='utf-8') as f:
+            f.write(report)
 
 class FinancialAgent:
     def __init__(self, tracker: TokenTracker, api_key: str, agent_id: int):
@@ -55,9 +90,7 @@ class FinancialAgent:
         self.tracker = tracker
         self.agent_id = agent_id
 
-    async def async_evaluate_batch(self, batch_contexts: list) -> dict:
-        model = "gemini-3.6-flash"
-        
+    async def async_evaluate_batch(self, batch_contexts: list, model: str = "gemini-3.6-flash") -> dict:
         system_instruction = """You are a strict, objective AI financial agent evaluating a BATCH of requests.
 CRITICAL RULES FOR EACH REQUEST:
 1. 90-DAY CHECK: Balance must NEVER fall below minimum_balance_to_keep.
@@ -67,7 +100,10 @@ CRITICAL RULES FOR EACH REQUEST:
 
         payload = [system_instruction]
         
-        for ctx in batch_contexts:
+        # Prevent mutating the context dicts when requeuing and splitting
+        contexts_copy = copy.deepcopy(batch_contexts)
+        
+        for ctx in contexts_copy:
             images = ctx.pop("Attached_Images", [])
             for img_data in images:
                 try:
@@ -76,7 +112,7 @@ CRITICAL RULES FOR EACH REQUEST:
                 except Exception as e:
                     logging.error(f"Failed to load image: {e}")
 
-        payload.append(f"\nBATCH DATA:\n{json.dumps(batch_contexts, indent=2, default=str)}")
+        payload.append(f"\nBATCH DATA:\n{json.dumps(contexts_copy, indent=2, default=str)}")
 
         try:
             response = await self.client.aio.models.generate_content(
